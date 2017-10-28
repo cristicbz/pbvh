@@ -9,6 +9,11 @@ pub struct Aabb {
 
 impl Aabb {
     #[inline]
+    pub fn from_unchecked_min_max(min: Vector3<f32>, max: Vector3<f32>) -> Self {
+        Aabb { min, max }
+    }
+
+    #[inline]
     pub fn negative() -> Self {
         Aabb {
             min: vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY),
@@ -41,8 +46,8 @@ impl Aabb {
     }
 
     #[inline]
-    pub fn union(bbs: &[Aabb]) -> Self {
-        bbs.iter().cloned().fold(Aabb::negative(), Aabb::merge)
+    pub fn union<I: IntoIterator<Item = Aabb>>(bbs: I) -> Self {
+        bbs.into_iter().fold(Aabb::negative(), Aabb::merge)
     }
 
     #[inline]

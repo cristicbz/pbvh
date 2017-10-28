@@ -10,8 +10,8 @@ pub struct Bvh<O: PartitionHeuristic> {
     nodes: Vec<Node>,
     leaves: Vec<u32>,
     centroids: Vec<Vector3<f32>>,
-    bbs: Vec<Vector3<f32>>,
-    new_bbs: Vec<Vector3<f32>>,
+    bbs: Vec<Aabb>,
+    new_bbs: Vec<Aabb>,
     _phantom: PhantomData<O>,
 }
 
@@ -69,9 +69,10 @@ impl<O: PartitionHeuristic> Bvh<O> {
         centroids.extend(bbs.iter().map(|bb| bb.centroid()));
 
         nodes.clear();
+        let root_aabb = Aabb::union(bbs.iter().cloned());
         if num_bbs <= min_leaves {
             nodes.push(Node {
-                aabb: Aabb::union(&bbs[..]),
+                aabb: root_aabb,
                 child: 0,
                 max_index: num_bbs as u32 - 1,
                 leaf_end: num_bbs as u32,
@@ -84,14 +85,13 @@ impl<O: PartitionHeuristic> Bvh<O> {
             {
                 let (root, root_index) = splitter.pop().unwrap();
                 debug_assert_eq!(root_index, 0);
-                let root_aabb = Aabb::union(&bbs[..]);
                 root.aabb = root_aabb;
                 root.max_index = num_bbs as u32 - 1;
                 let root_expansion = NodeExpansion::<O> {
                     node: root,
-                    bbs: bbs,
-                    centroids: centroids,
-                    leaves: leaves,
+                    bbs,
+                    centroids,
+                    leaves,
                     offset: 0,
                     _phantom: PhantomData,
                 };
