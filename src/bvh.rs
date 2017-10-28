@@ -10,19 +10,19 @@ pub struct Bvh<O: PartitionHeuristic> {
     nodes: Vec<Node>,
     leaves: Vec<u32>,
     centroids: Vec<Vector3<f32>>,
-    bbs: Vec<Aabb>,
-    new_bbs: Vec<Aabb>,
+    bbs: Vec<Vector3<f32>>,
+    new_bbs: Vec<Vector3<f32>>,
     _phantom: PhantomData<O>,
 }
 
 impl<O: PartitionHeuristic> Bvh<O> {
-    pub fn new() -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         Bvh {
-            nodes: Vec::new(),
-            leaves: Vec::new(),
-            bbs: Vec::new(),
-            new_bbs: Vec::new(),
-            centroids: Vec::new(),
+            nodes: Vec::with_capacity(capacity),
+            leaves: Vec::with_capacity(capacity),
+            bbs: Vec::with_capacity(capacity),
+            new_bbs: Vec::with_capacity(capacity),
+            centroids: Vec::with_capacity(capacity),
             _phantom: PhantomData,
         }
     }
@@ -36,12 +36,18 @@ impl<O: PartitionHeuristic> Bvh<O> {
             ref mut centroids,
             ..
         } = *self;
+        let min_leaves = min_leaves as u32;
         assert!(min_leaves >= 2, "min_leaves must be at least 2");
+        assert!(
+            min_leaves <= MAX_CAPACITY,
+            "min_leaves must be less than MAX_CAPACITY"
+        );
+        let min_leaves = min_leaves as u32;
 
         new_bbs.clear();
         new_bbs.extend(bbs_iter);
-        let num_bbs = new_bbs.len();
-        assert!(num_bbs <= (MAX_CAPACITY as usize));
+        let num_bbs = new_bbs.len() as u32;
+        assert!(num_bbs <= MAX_CAPACITY);
         if num_bbs == 0 {
             bbs.clear();
             new_bbs.clear();
@@ -51,10 +57,10 @@ impl<O: PartitionHeuristic> Bvh<O> {
             return;
         }
 
-        if num_bbs != leaves.len() {
+        if num_bbs != leaves.len() as u32 {
             mem::swap(bbs, new_bbs);
             leaves.clear();
-            leaves.extend(0..num_bbs as u32);
+            leaves.extend(0..num_bbs);
         } else {
             bbs.clear();
             bbs.extend(leaves.iter().map(|&index| new_bbs[index as usize]));
@@ -72,12 +78,12 @@ impl<O: PartitionHeuristic> Bvh<O> {
             });
             return;
         }
-        nodes.resize((num_bbs + 1) * 2, Node::new());
+        nodes.resize((num_bbs as usize + 1) * 2, Node::new());
         let num_nodes = {
             let splitter = SyncSplitter::new(nodes);
             {
                 let (root, root_index) = splitter.pop().unwrap();
-                assert_eq!(root_index, 0);
+                debug_assert_eq!(root_index, 0);
                 let root_aabb = Aabb::union(&bbs[..]);
                 root.aabb = root_aabb;
                 root.max_index = num_bbs as u32 - 1;
@@ -133,8 +139,8 @@ impl<O: PartitionHeuristic> Bvh<O> {
         loop {
             if node.leaf_end != INVALID_ID {
                 let (start, end) = (node.child as usize, node.leaf_end as usize);
-                assert!(end <= self.leaves.len());
-                assert!(end > start);
+                debug_assert!(end <= self.leaves.len());
+                debug_assert!(end > start);
                 for &leaf in &self.leaves[start..end] {
                     if leaf >= min_index {
                         handler(leaf as usize);
@@ -229,7 +235,7 @@ pub trait PartitionHeuristic: Send {
         bbs: &mut [Aabb],
         centroids: &mut [Vector3<f32>],
         leaves: &mut [u32],
-    ) -> Option<(usize, Aabb, Aabb)>;
+    ) -> Option<(u32, Aabb, Aabb)>;
 }
 
 pub trait SahBinLimits: Send {
@@ -269,8 +275,7 @@ impl SahBinLimits for TotalAabbLimit {
     }
 }
 
-pub trait SpecifyBinCount
-    : Send + Number + ArraySize<f32> + ArraySize<u32> + ArraySize<Aabb> {
+pub trait SpecifyBinCount: Send + Number {
     type CostArray: Array<f32>;
     type CountArray: Array<u32>;
     type AabbArray: Array<Aabb>;
@@ -300,6 +305,7 @@ struct Node {
 }
 
 impl Node {
+    #[inline]
     fn new() -> Self {
         Node {
             aabb: Aabb::negative(),
@@ -310,7 +316,7 @@ impl Node {
     }
 }
 
-const SEQUENTIAL_EXPANSION_THRESHOLD: usize = 512;
+const SEQUENTIAL_EXPANSION_THRESHOLD: usize = 128;
 
 struct NodeExpansion<'a, H: PartitionHeuristic> {
     node: &'a mut Node,
@@ -323,7 +329,7 @@ struct NodeExpansion<'a, H: PartitionHeuristic> {
 
 impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
     #[inline]
-    fn parallel_expand(mut self, min_leaves: usize, splitter: &'a SyncSplitter<Node>) {
+    fn parallel_expand(mut self, min_leaves: u32, splitter: &'a SyncSplitter<Node>) {
         while self.bbs.len() > SEQUENTIAL_EXPANSION_THRESHOLD {
             match self.expand_node(min_leaves, splitter) {
                 (Some(e1), Some(e2)) => {
@@ -339,7 +345,7 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
         self.sequential_expand(min_leaves, splitter);
     }
 
-    fn sequential_expand(mut self, min_leaves: usize, splitter: &'a SyncSplitter<Node>) {
+    fn sequential_expand(mut self, min_leaves: u32, splitter: &'a SyncSplitter<Node>) {
         loop {
             match self.expand_node(min_leaves, splitter) {
                 (Some(e1), Some(e2)) => {
@@ -354,7 +360,7 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
 
     fn expand_node(
         self,
-        min_leaves: usize,
+        min_leaves: u32,
         splitter: &'a SyncSplitter<Node>,
     ) -> (Option<Self>, Option<Self>) {
         let NodeExpansion {
@@ -366,24 +372,24 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
             ..
         } = self;
 
-        let len = bbs.len();
-        assert!(len > min_leaves);
-        assert_eq!(leaves.len(), len);
-        assert_eq!(centroids.len(), len);
+        let len = bbs.len() as u32;
+        debug_assert!(len > min_leaves);
+        debug_assert_eq!(leaves.len() as u32, len);
+        debug_assert_eq!(centroids.len() as u32, len);
 
         let (split, left_bb, right_bb) = match H::partition(&node.aabb, bbs, centroids, leaves) {
             Some(partition) => partition,
             None => {
                 node.child = offset;
-                node.leaf_end = offset + len as u32;
+                node.leaf_end = offset + len;
                 return (None, None);
             }
         };
 
-        assert!(split > 0 && split < len);
-        let (left_bbs, right_bbs) = bbs.split_at_mut(split);
-        let (left_centroids, right_centroids) = centroids.split_at_mut(split);
-        let (left_leaves, right_leaves) = leaves.split_at_mut(split);
+        debug_assert!(split > 0 && split < len);
+        let (left_bbs, right_bbs) = bbs.split_at_mut(split as usize);
+        let (left_centroids, right_centroids) = centroids.split_at_mut(split as usize);
+        let (left_leaves, right_leaves) = leaves.split_at_mut(split as usize);
         let (len, split) = (len as u32, split as u32);
         let ((child1, child2), index1) = splitter.pop_two().expect("not enough preallocated nodes");
 
@@ -394,7 +400,7 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
         child1.max_index = *left_leaves.iter().max().expect(
             "left_leaves shouldn't be empty",
         );
-        let left = if left_bbs.len() <= min_leaves {
+        let left = if left_bbs.len() as u32 <= min_leaves {
             child1.child = offset;
             child1.leaf_end = offset + split;
             None
@@ -413,7 +419,7 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
         child2.max_index = *right_leaves.iter().max().expect(
             "right_leaves shouldn't be empty",
         );
-        let right = if right_bbs.len() <= min_leaves {
+        let right = if right_bbs.len() as u32 <= min_leaves {
             child2.child = offset + split;
             child2.leaf_end = offset + len;
             None
@@ -487,10 +493,10 @@ impl<N: SpecifyBinCount> Bins<N> {
         bbs: &[Aabb],
         centroids: &[Vector3<f32>],
     ) -> Self {
-        const CHUNK_SIZE: usize = 4096;
+        const CHUNK_SIZE: usize = 32768;
 
         let len = bbs.len();
-        assert!(centroids.len() == len);
+        debug_assert!(centroids.len() == len);
         if len < CHUNK_SIZE {
             Self::create(binning_const, min_limit, axis, bbs, centroids)
         } else {
@@ -498,10 +504,10 @@ impl<N: SpecifyBinCount> Bins<N> {
             let (left_centroids, right_centroids) = centroids.split_at(len / 2);
             let (left_bins, right_bins) = rayon::join(
                 || {
-                    Self::create(binning_const, min_limit, axis, left_bbs, left_centroids)
+                    Self::par_create(binning_const, min_limit, axis, left_bbs, left_centroids)
                 },
                 || {
-                    Self::create(binning_const, min_limit, axis, right_bbs, right_centroids)
+                    Self::par_create(binning_const, min_limit, axis, right_bbs, right_centroids)
                 },
             );
             Self::merge(left_bins, right_bins)
@@ -516,11 +522,11 @@ impl<N: SpecifyBinCount, Limits: SahBinLimits> PartitionHeuristic
         bbs: &mut [Aabb],
         centroids: &mut [Vector3<f32>],
         leaves: &mut [u32],
-    ) -> Option<(usize, Aabb, Aabb)> {
+    ) -> Option<(u32, Aabb, Aabb)> {
         let len = bbs.len();
-        assert!(len >= 2);
-        assert_eq!(centroids.len(), len);
-        assert_eq!(leaves.len(), len);
+        debug_assert!(len >= 2);
+        debug_assert_eq!(centroids.len(), len);
+        debug_assert_eq!(leaves.len(), len);
 
         let (axis, min_limit, max_limit) = Limits::sah_bin_limits(aabb, bbs, centroids, leaves);
         if max_limit - min_limit <= 1e-5 {
@@ -576,18 +582,18 @@ impl<N: SpecifyBinCount, Limits: SahBinLimits> PartitionHeuristic
             return None;
         }
 
-        let len = bbs.len();
-        assert!(axis < 3);
-        assert!(len >= 2);
-        assert_eq!(centroids.len(), len);
-        assert_eq!(leaves.len(), len);
+        let len = bbs.len() as u32;
+        debug_assert!(axis < 3);
+        debug_assert!(len >= 2);
+        debug_assert_eq!(centroids.len() as u32, len);
+        debug_assert_eq!(leaves.len() as u32, len);
         let limit = (best_bin_index + 1) as f32;
-        let mut split = 0;
+        let mut split = 0u32;
         for i_leaf in 0..len {
-            if binning_const * (centroids[i_leaf][axis] - min_limit) < limit {
-                bbs.swap(split, i_leaf);
-                centroids.swap(split, i_leaf);
-                leaves.swap(split, i_leaf);
+            if binning_const * (centroids[i_leaf as usize][axis] - min_limit) < limit {
+                bbs.swap(split as usize, i_leaf as usize);
+                centroids.swap(split as usize, i_leaf as usize);
+                leaves.swap(split as usize, i_leaf as usize);
                 split += 1;
             }
         }
@@ -597,10 +603,12 @@ impl<N: SpecifyBinCount, Limits: SahBinLimits> PartitionHeuristic
 
 #[cfg(test)]
 mod tests {
-    use super::{Bvh, TotalAabbLimit, BinnedSahPartition, Four};
+    use super::{Bvh, TotalAabbLimit, CentroidAabbLimit, Two, BinnedSahPartition, Six,
+                PartitionHeuristic};
     use super::super::aabb::Aabb;
     use cgmath::{Vector3, vec3};
     use fnv::FnvHashSet;
+    use quickcheck::quickcheck;
 
     #[derive(Copy, Clone, Debug)]
     struct Sphere {
@@ -646,55 +654,63 @@ mod tests {
         }
     }
 
-    type TotalBvh = Bvh<BinnedSahPartition<Four, TotalAabbLimit>>;
+    fn intersects_sphere_helper<H: PartitionHeuristic>(
+        boxes: ArbitraryAabbVec,
+        spheres: Vec<(ArbitrarySphere, usize)>,
+        min_leaves: usize,
+    ) -> bool {
+        let min_leaves = 2 + (min_leaves % (boxes.len() + 1));
+        let boxes: Vec<_> = boxes.iter().cloned().map(make_aabb).collect();
+        let spheres: Vec<_> = spheres
+            .iter()
+            .map(|arbitrary| (make_sphere(arbitrary.0), arbitrary.1))
+            .collect();
+        let mut total_bvh = Bvh::<H>::with_capacity(boxes.len());
 
-    quickcheck! {
-        fn total_intersects_sphere(
-            boxes: ArbitraryAabbVec,
-            spheres: Vec<(ArbitrarySphere, usize)>,
-            min_leaves: usize
-            ) -> bool {
-            let min_leaves  = 2 + (min_leaves % (boxes.len() + 1));
-            let boxes: Vec<_> = boxes.iter().cloned().map(make_aabb).collect();
-            let spheres: Vec<_> = spheres
-                .iter()
-                .map(|arbitrary| (make_sphere(arbitrary.0), arbitrary.1))
-                .collect();
-            let mut total_bvh = TotalBvh::new();
-
-            let mut expected =
-                FnvHashSet::with_capacity_and_hasher(boxes.len(), Default::default());
-            let mut actual = FnvHashSet::with_capacity_and_hasher(boxes.len(), Default::default());
-            total_bvh.rebuild(min_leaves, boxes.iter().cloned());
-            for &(sphere, min_index) in &spheres {
-                let min_index = min_index % (boxes.len() + 1);
-                total_bvh.on_sphere_intersection(
-                    sphere.center,
-                    sphere.radius,
-                    min_index,
-                    |index| { actual.insert(index); },
-                    );
-                for (index, bb) in boxes.iter().enumerate().skip(min_index) {
-                    if bb.intersects_sphere(sphere.center, sphere.radius) {
-                        expected.insert(index);
-                    }
+        let mut expected = FnvHashSet::with_capacity_and_hasher(boxes.len(), Default::default());
+        let mut actual = FnvHashSet::with_capacity_and_hasher(boxes.len(), Default::default());
+        total_bvh.rebuild(min_leaves, boxes.iter().cloned());
+        for &(sphere, min_index) in &spheres {
+            let min_index = min_index % (boxes.len() + 1);
+            total_bvh.on_sphere_intersection(sphere.center, sphere.radius, min_index, |index| {
+                actual.insert(index);
+            });
+            for (index, bb) in boxes.iter().enumerate().skip(min_index) {
+                if bb.intersects_sphere(sphere.center, sphere.radius) {
+                    expected.insert(index);
                 }
-                if expected != actual {
-                    error!(
-                        "boxes={:?} sphere={:?} expected={:?} actual={:?} min_index={:?}",
-                        boxes,
-                        sphere,
-                        expected,
-                        actual,
-                        min_index
-                        );
-                    return false;
-                }
-
-                expected.clear();
-                actual.clear();
             }
-            true
+            if expected != actual {
+                error!(
+                    "boxes={:?} sphere={:?} expected={:?} actual={:?} min_index={:?}",
+                    boxes,
+                    sphere,
+                    expected,
+                    actual,
+                    min_index
+                );
+                return false;
+            }
+
+            expected.clear();
+            actual.clear();
         }
+        true
+    }
+
+    #[test]
+    fn total_intersects_sphere() {
+        quickcheck(
+            intersects_sphere_helper::<BinnedSahPartition<Six, TotalAabbLimit>> as
+                fn(ArbitraryAabbVec, Vec<(ArbitrarySphere, usize)>, usize) -> bool,
+        );
+    }
+
+    #[test]
+    fn centroid_intersects_sphere() {
+        quickcheck(
+            intersects_sphere_helper::<BinnedSahPartition<Two, CentroidAabbLimit>> as
+                fn(ArbitraryAabbVec, Vec<(ArbitrarySphere, usize)>, usize) -> bool,
+        );
     }
 }

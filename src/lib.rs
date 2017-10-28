@@ -3,7 +3,6 @@ extern crate rayon;
 extern crate sync_splitter;
 
 #[cfg(test)]
-#[macro_use]
 extern crate quickcheck;
 
 #[cfg(test)]
@@ -16,4 +15,6 @@ extern crate fnv;
 mod aabb;
 mod bvh;
 
-pub use bvh::{Bvh, BinnedSahPartition, CentroidAabbLimit, TotalAabbLimit};
+pub use bvh::{Bvh, BinnedSahPartition, CentroidAabbLimit, TotalAabbLimit, Two, Four, Six, Eight,
+              Sixteen, PartitionHeuristic};
+pub use aabb::Aabb;
