@@ -14,6 +14,20 @@ impl Aabb {
     }
 
     #[inline]
+    pub fn clip_axis_min(&self, axis: u32, limit: f32) -> Self {
+        let mut clipped = *self;
+        clipped.min[axis as usize] = limit;
+        clipped
+    }
+
+    #[inline]
+    pub fn clip_axis_max(&self, axis: u32, limit: f32) -> Self {
+        let mut clipped = *self;
+        clipped.max[axis as usize] = limit;
+        clipped
+    }
+
+    #[inline]
     pub fn negative() -> Self {
         Aabb {
             min: vec3(f32::INFINITY, f32::INFINITY, f32::INFINITY),
@@ -58,11 +72,10 @@ impl Aabb {
 
     #[inline]
     pub fn intersects_sphere(&self, position: Vector3<f32>, radius: f32) -> bool {
-        return self.min[0] - position[0] <= radius && self.min[1] - position[1] <= radius &&
+        self.min[0] - position[0] <= radius && self.min[1] - position[1] <= radius &&
             self.min[2] - position[2] <= radius &&
-            position[0] - self.max[0] <= radius &&
-            position[1] - self.max[1] <= radius &&
-            position[2] - self.max[2] <= radius;
+            position[0] - self.max[0] <= radius && position[1] - self.max[1] <= radius &&
+            position[2] - self.max[2] <= radius
     }
 
     #[inline]
@@ -92,12 +105,12 @@ impl Aabb {
 
     #[inline]
     pub fn merge(mut self, other: Aabb) -> Self {
-        self.add_aabb(&other);
+        self.add_aabb(other);
         self
     }
 
     #[inline]
-    pub fn add_aabb(&mut self, other: &Aabb) {
+    pub fn add_aabb(&mut self, other: Aabb) {
         let Aabb {
             ref mut min,
             ref mut max,
@@ -105,31 +118,14 @@ impl Aabb {
         let Aabb {
             min: other_min,
             max: other_max,
-        } = *other;
+        } = other;
+        min.x = min.x.min(other_min.x);
+        min.y = min.y.min(other_min.y);
+        min.z = min.z.min(other_min.z);
 
-        if other_min[0] < min[0] {
-            min[0] = other_min[0];
-        }
-
-        if other_min[1] < min[1] {
-            min[1] = other_min[1];
-        }
-
-        if other_min[2] < min[2] {
-            min[2] = other_min[2];
-        }
-
-        if other_max[0] > max[0] {
-            max[0] = other_max[0];
-        }
-
-        if other_max[1] > max[1] {
-            max[1] = other_max[1];
-        }
-
-        if other_max[2] > max[2] {
-            max[2] = other_max[2];
-        }
+        max.x = max.x.max(other_max.x);
+        max.y = max.y.max(other_max.y);
+        max.z = max.z.max(other_max.z);
     }
 }
 
@@ -141,49 +137,17 @@ mod tests {
     #[test]
     fn aabb_union() {
         let aabb = Aabb::union(
-            &[
+            [
                 Aabb::of_sphere(Vector3::zero(), 1.0),
                 Aabb::of_sphere(Vector3::zero(), 2.0),
                 Aabb::of_sphere(vec3(1.0, 0.0, 0.0), 1.0),
                 Aabb::of_sphere(vec3(-1.0, 0.0, 0.0), 2.0),
                 Aabb::of_sphere(vec3(1.0, 2.0, 0.0), 1.0),
-            ],
+            ].iter()
+                .cloned(),
         );
 
         assert_eq!(aabb.min(), vec3(-3.0, -2.0, -2.0));
         assert_eq!(aabb.max(), vec3(2.0, 3.0, 2.0));
-    }
-
-    #[test]
-    fn aabb_sphere() {
-        let aabb = Aabb::of_points(&[vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0)]);
-
-        assert!(aabb.intersects_sphere(vec3(0.0, 0.0, 0.0), 1.0));
-        assert!(aabb.intersects_sphere(vec3(0.0, 0.0, 0.0), 0.1));
-        assert!(aabb.intersects_sphere(vec3(0.0, 0.0, 0.0), 10.0));
-        assert!(aabb.intersects_sphere(vec3(2.0, 0.0, 0.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(0.0, 2.0, 0.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(0.0, 0.0, 2.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(2.0, 2.0, 0.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(0.0, 2.0, 2.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(2.0, 0.0, 2.0), 1.5));
-        assert!(!aabb.intersects_sphere(vec3(2.0, 0.0, 0.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(0.0, 2.0, 0.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(0.0, 0.0, 2.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(2.0, 2.0, 0.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(0.0, 2.0, 2.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(2.0, 0.0, 2.0), 0.9));
-        assert!(aabb.intersects_sphere(vec3(-2.0, 0.0, 0.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(0.0, -2.0, 0.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(0.0, 0.0, -2.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(-2.0, -2.0, 0.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(0.0, -2.0, -2.0), 1.5));
-        assert!(aabb.intersects_sphere(vec3(-2.0, 0.0, -2.0), 1.5));
-        assert!(!aabb.intersects_sphere(vec3(-2.0, 0.0, 0.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(0.0, -2.0, 0.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(0.0, 0.0, -2.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(-2.0, -2.0, 0.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(0.0, -2.0, -2.0), 0.9));
-        assert!(!aabb.intersects_sphere(vec3(-2.0, 0.0, -2.0), 0.9));
     }
 }

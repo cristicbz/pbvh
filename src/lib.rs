@@ -16,5 +16,5 @@ mod aabb;
 mod bvh;
 
 pub use bvh::{Bvh, BinnedSahPartition, CentroidAabbLimit, TotalAabbLimit, Two, Four, Six, Eight,
-              Sixteen, PartitionHeuristic};
+              Sixteen, PartitionHeuristic, SmallSphereProbe, LargeSphereProbe};
 pub use aabb::Aabb;

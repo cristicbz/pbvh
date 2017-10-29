@@ -9,6 +9,6 @@ rayon = "0.8.2"
 sync_splitter = "0.2.0"
 
 [dev-dependencies]
+fnv = "1.0.5"
 log = "0.3.8"
 quickcheck = "0.4.1"
-fnv = "1.0.5"

@@ -1,10 +1,111 @@
 use super::aabb::Aabb;
-use cgmath::Vector3;
+use cgmath::{Vector3, vec3, ElementWise};
 use rayon;
 use std::f32;
 use std::marker::PhantomData;
 use std::mem;
 use sync_splitter::SyncSplitter;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Intersection {
+    None,
+    Partial,
+    Full,
+}
+
+pub trait BvhProbe {
+    fn intersect(&self, bb: Aabb) -> Intersection;
+    fn intersect_bool(&self, bb: Aabb) -> bool {
+        self.intersect(bb) != Intersection::None
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct SmallSphereProbe {
+    smin: Vector3<f32>,
+    smax: Vector3<f32>,
+}
+
+impl SmallSphereProbe {
+    pub fn new(center: Vector3<f32>, radius: f32) -> Self {
+        SmallSphereProbe {
+            smin: vec3(center.x - radius, center.y - radius, center.z - radius),
+            smax: vec3(center.x + radius, center.y + radius, center.z + radius),
+        }
+    }
+}
+
+impl BvhProbe for SmallSphereProbe {
+    #[inline]
+    fn intersect(&self, bb: Aabb) -> Intersection {
+        let a = bb.min() - self.smax;
+        let b = self.smin - bb.max();
+        let bits = a.x.to_bits() & a.y.to_bits() & a.z.to_bits() & b.x.to_bits() & b.y.to_bits() &
+            b.z.to_bits();
+        if bits >> 31 == 0 {
+            Intersection::None
+        } else {
+            Intersection::Partial
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct LargeSphereProbe {
+    center: Vector3<f32>,
+    squared_radius: f32,
+}
+
+impl LargeSphereProbe {
+    pub fn new(center: Vector3<f32>, radius: f32) -> Self {
+        LargeSphereProbe {
+            center,
+            squared_radius: radius * radius,
+        }
+    }
+}
+
+impl BvhProbe for LargeSphereProbe {
+    #[inline]
+    fn intersect(&self, bb: Aabb) -> Intersection {
+        let mut d2 = self.squared_radius;
+        let a = self.center - bb.min();
+        let b = bb.max() - self.center;
+
+        let a2 = a.mul_element_wise(a);
+        let b2 = b.mul_element_wise(b);
+
+        if a.x < 0.0 {
+            d2 -= a2.x
+        } else if b.x < 0.0 {
+            d2 -= b2.x
+        }
+
+        if a.y < 0.0 {
+            d2 -= a2.y
+        } else if b.y < 0.0 {
+            d2 -= b2.y
+        }
+
+        if a.z < 0.0 {
+            d2 -= a2.z;
+        } else if b.z < 0.0 {
+            d2 -= b2.z;
+        }
+
+        if d2 > 0.0 {
+            if a2.x + a2.y + a2.z - self.squared_radius < 0.0 &&
+                b2.x + b2.y + b2.z - self.squared_radius < 0.0
+            {
+                Intersection::Full
+            } else {
+                Intersection::Partial
+            }
+        } else {
+            Intersection::None
+        }
+    }
+}
 
 pub struct Bvh<O: PartitionHeuristic> {
     nodes: Vec<Node>,
@@ -73,9 +174,10 @@ impl<O: PartitionHeuristic> Bvh<O> {
         if num_bbs <= min_leaves {
             nodes.push(Node {
                 aabb: root_aabb,
-                child: 0,
-                max_index: num_bbs as u32 - 1,
-                leaf_end: num_bbs as u32,
+                child: INVALID_ID,
+                max_index: num_bbs - 1,
+                leaf_start: 0,
+                leaf_end: num_bbs,
             });
             return;
         }
@@ -86,13 +188,14 @@ impl<O: PartitionHeuristic> Bvh<O> {
                 let (root, root_index) = splitter.pop().unwrap();
                 debug_assert_eq!(root_index, 0);
                 root.aabb = root_aabb;
+                root.leaf_start = 0;
+                root.leaf_end = num_bbs;
                 root.max_index = num_bbs as u32 - 1;
                 let root_expansion = NodeExpansion::<O> {
                     node: root,
                     bbs,
                     centroids,
                     leaves,
-                    offset: 0,
                     _phantom: PhantomData,
                 };
                 root_expansion.parallel_expand(min_leaves, &splitter);
@@ -103,128 +206,153 @@ impl<O: PartitionHeuristic> Bvh<O> {
     }
 
     #[inline]
-    pub fn on_sphere_intersection<F>(
-        &self,
-        position: Vector3<f32>,
-        radius: f32,
-        min_index: usize,
-        mut handler: F,
-    ) where
+    pub fn intersect<F, P>(&self, min_index: usize, probe: &P, mut handler: F)
+    where
         F: FnMut(usize),
+        P: BvhProbe,
     {
-        if self.nodes.is_empty() || min_index >= self.leaves.len() ||
-            !self.nodes[0].aabb.intersects_sphere(position, radius)
-        {
+        if self.nodes.is_empty() || min_index >= self.leaves.len() {
             return;
         }
-        self.sphere_intersector(
-            &mut handler,
-            position,
-            radius,
-            min_index as u32,
-            &self.nodes[0],
-        );
+        let root = &self.nodes[0];
+        let intersect = probe.intersect(root.aabb);
+        let min_index = min_index as u32;
+        if intersect == Intersection::None {
+            return;
+        }
+        if root.child == INVALID_ID || intersect == Intersection::Full {
+            self.handle_all(&mut handler, min_index, &self.nodes[0]);
+        } else {
+            self.intersect_impl(&mut handler, probe, min_index as u32, &self.nodes[0]);
+        }
     }
 
-    fn sphere_intersector<'a, F>(
+    #[inline]
+    fn handle_all<'a, F>(&'a self, handler: &mut F, min_index: u32, node: &'a Node)
+    where
+        F: FnMut(usize),
+    {
+        let (start, end) = (node.leaf_start as usize, node.leaf_end as usize);
+        debug_assert!(end <= self.leaves.len());
+        debug_assert!(end > start);
+        for &leaf in &self.leaves[start..end] {
+            if leaf >= min_index {
+                handler(leaf as usize);
+            }
+        }
+    }
+
+    fn intersect_impl<'a, F, P>(
         &'a self,
         handler: &mut F,
-        position: Vector3<f32>,
-        radius: f32,
+        probe: &P,
         min_index: u32,
         mut node: &'a Node,
     ) where
         F: FnMut(usize),
+        P: BvhProbe,
     {
         loop {
-            if node.leaf_end != INVALID_ID {
-                let (start, end) = (node.child as usize, node.leaf_end as usize);
-                debug_assert!(end <= self.leaves.len());
-                debug_assert!(end > start);
-                for &leaf in &self.leaves[start..end] {
-                    if leaf >= min_index {
-                        handler(leaf as usize);
-                    }
-                }
-                return;
+            let child_index = node.child as usize;
+            let child2 = &self.nodes[child_index + 1];
+            let child1 = &self.nodes[child_index];
+            let expand1 = if child1.max_index < min_index {
+                false
             } else {
-                let child_index = node.child as usize;
-                let child2 = &self.nodes[child_index + 1];
-                let child1 = &self.nodes[child_index];
-                let intersect1 = child1.max_index >= min_index &&
-                    child1.aabb.intersects_sphere(position, radius);
-                let intersect2 = child2.max_index >= min_index &&
-                    child2.aabb.intersects_sphere(position, radius);
-
-                if intersect2 {
-                    if intersect1 {
-                        self.sphere_intersector(handler, position, radius, min_index, child1);
-                    }
-                    node = child2;
-                } else if intersect1 {
-                    node = child1;
+                let intersect = probe.intersect(child1.aabb);
+                if intersect == Intersection::None {
+                    false
+                } else if child1.child == INVALID_ID || intersect == Intersection::Full {
+                    self.handle_all(handler, min_index, child1);
+                    false
                 } else {
-                    return;
+                    true
                 }
+            };
+            let expand2 = if child2.max_index < min_index {
+                false
+            } else {
+                let intersect = probe.intersect(child2.aabb);
+                if intersect == Intersection::None {
+                    false
+                } else if child2.child == INVALID_ID || intersect == Intersection::Full {
+                    self.handle_all(handler, min_index, child2);
+                    false
+                } else {
+                    true
+                }
+            };
+
+            if expand2 {
+                if expand1 {
+                    self.intersect_impl(handler, probe, min_index, child1);
+                }
+                node = child2;
+            } else if expand1 {
+                node = child1;
+            } else {
+                return;
             }
         }
     }
 }
 
+pub trait BinCount: Send + Sync + 'static {
+    type CostArray: Array<f32>;
+    type CountArray: Array<u32>;
+    type AabbArray: Array<Aabb>;
 
-pub trait Number: Send {
-    fn specify_number() -> usize;
+    fn bin_count() -> usize;
+    fn new_cost_array() -> Self::CostArray;
+    fn new_count_array() -> Self::CountArray;
+    fn new_aabb_array() -> Self::AabbArray;
 }
 
-pub trait Array<T: Copy + Sync + Send>: AsRef<[T]> + AsMut<[T]> + Sync + Send {
-    fn of(value: T) -> Self;
-}
 
-pub trait ArraySize<T: Copy + Sync + Send>: Send {
-    type ArrayOfSize: Array<T>;
-}
+pub trait Array<T: Copy + Sync + Send>: AsRef<[T]> + AsMut<[T]> + Sync + Send {}
 
-macro_rules! impl_numbers {
-    ($(#[number_value($value:expr)] pub enum $name:ident {})+) => {
+macro_rules! impl_bin_count {
+    ($(#[count($value:expr)] pub enum $name:ident {})+) => {
         $(
-            #[allow(unused)]
             pub enum $name {}
 
-            impl Number for $name {
-                #[inline]
-                fn specify_number() -> usize {
-                    $value
-                }
-            }
+            impl<T: Copy + Sync + Send> Array<T> for [T; $value] {}
 
-            impl<T: Copy + Sync + Send> Array<T> for [T; $value] {
-                #[inline]
-                fn of(value: T) -> Self {
-                    [value; $value]
-                }
-            }
+            impl BinCount for $name {
+                type CostArray = [f32; $value];
+                type CountArray = [u32; $value];
+                type AabbArray = [Aabb; $value];
 
-            impl<T: Copy + Sync + Send> ArraySize<T> for $name {
-                type ArrayOfSize = [T; $value];
+                #[inline]
+                fn bin_count() -> usize { $value }
+
+                #[inline]
+                fn new_cost_array() -> Self::CostArray { [0.0; $value] }
+
+                #[inline]
+                fn new_count_array() -> Self::CountArray { [0; $value] }
+
+                #[inline]
+                fn new_aabb_array() -> Self::AabbArray { [Aabb::negative(); $value] }
             }
             )+
     }
 }
 
-impl_numbers! {
-    #[number_value(2)]
+impl_bin_count! {
+    #[count(2)]
     pub enum Two {}
 
-    #[number_value(4)]
+    #[count(4)]
     pub enum Four {}
 
-    #[number_value(6)]
+    #[count(6)]
     pub enum Six {}
 
-    #[number_value(8)]
+    #[count(8)]
     pub enum Eight {}
 
-    #[number_value(16)]
+    #[count(16)]
     pub enum Sixteen {}
 }
 
@@ -275,21 +403,7 @@ impl SahBinLimits for TotalAabbLimit {
     }
 }
 
-pub trait SpecifyBinCount: Send + Number {
-    type CostArray: Array<f32>;
-    type CountArray: Array<u32>;
-    type AabbArray: Array<Aabb>;
-}
-impl<N> SpecifyBinCount for N
-where
-    N: Number + ArraySize<f32> + ArraySize<u32> + ArraySize<Aabb>,
-{
-    type CostArray = <N as ArraySize<f32>>::ArrayOfSize;
-    type CountArray = <N as ArraySize<u32>>::ArrayOfSize;
-    type AabbArray = <N as ArraySize<Aabb>>::ArrayOfSize;
-}
-
-pub struct BinnedSahPartition<N: SpecifyBinCount, Limits: SahBinLimits> {
+pub struct BinnedSahPartition<N: BinCount, Limits: SahBinLimits> {
     _phantom: PhantomData<(N, Limits)>,
 }
 
@@ -301,6 +415,7 @@ struct Node {
     aabb: Aabb,
     max_index: u32,
     child: u32,
+    leaf_start: u32,
     leaf_end: u32,
 }
 
@@ -310,6 +425,7 @@ impl Node {
         Node {
             aabb: Aabb::negative(),
             child: INVALID_ID,
+            leaf_start: INVALID_ID,
             leaf_end: INVALID_ID,
             max_index: INVALID_ID,
         }
@@ -323,7 +439,6 @@ struct NodeExpansion<'a, H: PartitionHeuristic> {
     bbs: &'a mut [Aabb],
     centroids: &'a mut [Vector3<f32>],
     leaves: &'a mut [u32],
-    offset: u32,
     _phantom: PhantomData<H>,
 }
 
@@ -368,10 +483,8 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
             bbs,
             centroids,
             leaves,
-            offset,
             ..
         } = self;
-
         let len = bbs.len() as u32;
         debug_assert!(len > min_leaves);
         debug_assert_eq!(leaves.len() as u32, len);
@@ -380,8 +493,7 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
         let (split, left_bb, right_bb) = match H::partition(&node.aabb, bbs, centroids, leaves) {
             Some(partition) => partition,
             None => {
-                node.child = offset;
-                node.leaf_end = offset + len;
+                node.child = INVALID_ID;
                 return (None, None);
             }
         };
@@ -390,19 +502,17 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
         let (left_bbs, right_bbs) = bbs.split_at_mut(split as usize);
         let (left_centroids, right_centroids) = centroids.split_at_mut(split as usize);
         let (left_leaves, right_leaves) = leaves.split_at_mut(split as usize);
-        let (len, split) = (len as u32, split as u32);
+        let split_offset = node.leaf_start + split;
         let ((child1, child2), index1) = splitter.pop_two().expect("not enough preallocated nodes");
 
         node.child = index1 as u32;
-        node.leaf_end = INVALID_ID;
-
         child1.aabb = left_bb;
         child1.max_index = *left_leaves.iter().max().expect(
             "left_leaves shouldn't be empty",
         );
+        child1.leaf_start = node.leaf_start;
+        child1.leaf_end = split_offset;
         let left = if left_bbs.len() as u32 <= min_leaves {
-            child1.child = offset;
-            child1.leaf_end = offset + split;
             None
         } else {
             Some(NodeExpansion {
@@ -410,7 +520,6 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
                 bbs: left_bbs,
                 centroids: left_centroids,
                 leaves: left_leaves,
-                offset: offset,
                 _phantom: PhantomData,
             })
         };
@@ -419,9 +528,9 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
         child2.max_index = *right_leaves.iter().max().expect(
             "right_leaves shouldn't be empty",
         );
+        child2.leaf_start = split_offset;
+        child2.leaf_end = node.leaf_end;
         let right = if right_bbs.len() as u32 <= min_leaves {
-            child2.child = offset + split;
-            child2.leaf_end = offset + len;
             None
         } else {
             Some(NodeExpansion {
@@ -429,7 +538,6 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
                 bbs: right_bbs,
                 centroids: right_centroids,
                 leaves: right_leaves,
-                offset: offset + split,
                 _phantom: PhantomData,
             })
         };
@@ -440,27 +548,27 @@ impl<'a, H: PartitionHeuristic> NodeExpansion<'a, H> {
 
 
 #[derive(Copy, Clone)]
-struct Bins<N: SpecifyBinCount> {
+struct Bins<N: BinCount> {
     bbs: N::AabbArray,
     counts: N::CountArray,
 }
 
-impl<N: SpecifyBinCount> Bins<N> {
+impl<N: BinCount> Bins<N> {
     fn identity() -> Self {
         Bins {
-            bbs: N::AabbArray::of(Aabb::negative()),
-            counts: N::CountArray::of(0),
+            bbs: N::new_aabb_array(),
+            counts: N::new_count_array(),
         }
     }
 
     fn merge(mut self, other: Self) -> Self {
-        for ((count, bb), (other_count, other_bb)) in
+        for ((count, bb), (&other_count, &other_bb)) in
             self.counts.as_mut().iter_mut().zip(self.bbs.as_mut()).zip(
                 other.counts.as_ref().iter().zip(other.bbs.as_ref()),
             )
         {
 
-            *count += *other_count;
+            *count += other_count;
             bb.add_aabb(other_bb);
         }
         self
@@ -477,7 +585,7 @@ impl<N: SpecifyBinCount> Bins<N> {
         {
             let bin_counts = bins.counts.as_mut();
             let bin_bbs = bins.bbs.as_mut();
-            for (bb, centroid) in bbs.iter().zip(centroids) {
+            for (&bb, centroid) in bbs.iter().zip(centroids) {
                 let bin_index = (binning_const * (centroid[axis] - min_limit)) as usize;
                 bin_counts[bin_index] += 1;
                 bin_bbs[bin_index].add_aabb(bb);
@@ -515,8 +623,7 @@ impl<N: SpecifyBinCount> Bins<N> {
     }
 }
 
-impl<N: SpecifyBinCount, Limits: SahBinLimits> PartitionHeuristic
-    for BinnedSahPartition<N, Limits> {
+impl<N: BinCount, Limits: SahBinLimits> PartitionHeuristic for BinnedSahPartition<N, Limits> {
     fn partition(
         aabb: &Aabb,
         bbs: &mut [Aabb],
@@ -533,26 +640,26 @@ impl<N: SpecifyBinCount, Limits: SahBinLimits> PartitionHeuristic
             return None;
         }
 
-        let binning_const = (1.0 - 1e-5) * N::specify_number() as f32 / (max_limit - min_limit);
+        let binning_const = (1.0 - 1e-5) * N::bin_count() as f32 / (max_limit - min_limit);
         let bins = Bins::<N>::par_create(binning_const, min_limit, axis, bbs, centroids);
-        let bin_counts = bins.counts.as_ref();
         let bin_bbs = bins.bbs.as_ref();
+        let bin_counts = bins.counts.as_ref();
 
-        let num_bins = N::specify_number();
-        let mut a_left_bbs = N::AabbArray::of(Aabb::negative());
-        let mut a_left_costs = N::CostArray::of(0.0);
+        let num_bins = N::bin_count();
+        let mut a_left_bbs = N::new_aabb_array();
+        let mut a_left_costs = N::new_cost_array();
 
         {
             let left_bbs = a_left_bbs.as_mut();
             let left_costs = a_left_costs.as_mut();
             let mut left_bb = Aabb::negative();
-            let mut left_count = 0u32;
+            let mut left_count = 0;
             for bin_index in 0..num_bins - 1 {
-                left_bb.add_aabb(&bin_bbs[bin_index]);
+                left_bb.add_aabb(bin_bbs[bin_index]);
                 left_count += bin_counts[bin_index];
 
                 left_bbs[bin_index] = left_bb;
-                left_costs[bin_index] = left_bb.area() * (left_count as f32);
+                left_costs[bin_index] = left_bb.area() * left_count as f32;
             }
         }
 
@@ -560,15 +667,15 @@ impl<N: SpecifyBinCount, Limits: SahBinLimits> PartitionHeuristic
         let left_costs = a_left_costs.as_ref();
 
         let mut best_bin_cost = f32::INFINITY;
-        let mut best_bin_index = N::specify_number() + 1;
+        let mut best_bin_index = N::bin_count() + 1;
         let mut best_right_bb = Aabb::negative();
         {
             let mut right_bb = Aabb::negative();
-            let mut right_count = 0u32;
+            let mut right_count = 0;
             for bin_index in (0..num_bins - 1).rev() {
-                right_bb.add_aabb(&bin_bbs[bin_index + 1]);
+                right_bb.add_aabb(bin_bbs[bin_index + 1]);
                 right_count += bin_counts[bin_index + 1];
-                let cost = left_costs[bin_index] + right_bb.area() * (right_count as f32);
+                let cost = left_costs[bin_index] + right_bb.area() * right_count as f32;
 
                 if cost < best_bin_cost {
                     best_bin_cost = cost;
@@ -604,17 +711,11 @@ impl<N: SpecifyBinCount, Limits: SahBinLimits> PartitionHeuristic
 #[cfg(test)]
 mod tests {
     use super::{Bvh, TotalAabbLimit, CentroidAabbLimit, Two, BinnedSahPartition, Six,
-                PartitionHeuristic};
+                PartitionHeuristic, SmallSphereProbe, LargeSphereProbe, BvhProbe};
     use super::super::aabb::Aabb;
     use cgmath::{Vector3, vec3};
     use fnv::FnvHashSet;
     use quickcheck::quickcheck;
-
-    #[derive(Copy, Clone, Debug)]
-    struct Sphere {
-        center: Vector3<f32>,
-        radius: f32,
-    }
 
     type ArbitraryFloat = i32;
     type ArbitraryVec3 = (ArbitraryFloat, ArbitraryFloat, ArbitraryFloat);
@@ -647,70 +748,168 @@ mod tests {
         )
     }
 
-    fn make_sphere(sphere: ArbitrarySphere) -> Sphere {
-        Sphere {
-            center: make_vec3(sphere.0),
-            radius: make_positive_float(sphere.1),
-        }
+    fn make_sphere(sphere: ArbitrarySphere) -> LargeSphereProbe {
+        LargeSphereProbe::new(make_vec3(sphere.0), make_positive_float(sphere.1))
     }
 
-    fn intersects_sphere_helper<H: PartitionHeuristic>(
-        boxes: ArbitraryAabbVec,
+    fn intersect_sphere_helper<H: PartitionHeuristic>(
+        first: ArbitraryAabbVec,
+        second: ArbitraryAabbVec,
         spheres: Vec<(ArbitrarySphere, usize)>,
         min_leaves: usize,
     ) -> bool {
-        let min_leaves = 2 + (min_leaves % (boxes.len() + 1));
-        let boxes: Vec<_> = boxes.iter().cloned().map(make_aabb).collect();
+        let max_len = first.len().max(second.len());
+        let min_leaves = 2 + (min_leaves % (max_len + 1));
         let spheres: Vec<_> = spheres
             .iter()
             .map(|arbitrary| (make_sphere(arbitrary.0), arbitrary.1))
             .collect();
-        let mut total_bvh = Bvh::<H>::with_capacity(boxes.len());
+        let mut total_bvh = Bvh::<H>::with_capacity(max_len);
 
-        let mut expected = FnvHashSet::with_capacity_and_hasher(boxes.len(), Default::default());
-        let mut actual = FnvHashSet::with_capacity_and_hasher(boxes.len(), Default::default());
-        total_bvh.rebuild(min_leaves, boxes.iter().cloned());
-        for &(sphere, min_index) in &spheres {
-            let min_index = min_index % (boxes.len() + 1);
-            total_bvh.on_sphere_intersection(sphere.center, sphere.radius, min_index, |index| {
-                actual.insert(index);
-            });
-            for (index, bb) in boxes.iter().enumerate().skip(min_index) {
-                if bb.intersects_sphere(sphere.center, sphere.radius) {
-                    expected.insert(index);
+        let mut expected = FnvHashSet::with_capacity_and_hasher(max_len, Default::default());
+        let mut actual = FnvHashSet::with_capacity_and_hasher(max_len, Default::default());
+        for boxes in &[&first, &first, &second, &first] {
+            let boxes: Vec<_> = boxes.iter().cloned().map(make_aabb).collect();
+            total_bvh.rebuild(min_leaves, boxes.iter().cloned());
+            for &(sphere, min_index) in &spheres {
+                let min_index = min_index % (boxes.len() + 1);
+                total_bvh.intersect(min_index, &sphere, |index| { actual.insert(index); });
+                for (index, &bb) in boxes.iter().enumerate().skip(min_index) {
+                    if sphere.intersect_bool(bb) {
+                        expected.insert(index);
+                    }
                 }
-            }
-            if expected != actual {
-                error!(
-                    "boxes={:?} sphere={:?} expected={:?} actual={:?} min_index={:?}",
-                    boxes,
-                    sphere,
-                    expected,
-                    actual,
-                    min_index
-                );
-                return false;
-            }
+                if expected != actual {
+                    error!(
+                        "boxes={:?} sphere={:?} expected={:?} actual={:?} min_index={:?}",
+                        boxes,
+                        sphere,
+                        expected,
+                        actual,
+                        min_index
+                    );
+                    return false;
+                }
 
-            expected.clear();
-            actual.clear();
+                expected.clear();
+                actual.clear();
+            }
         }
         true
     }
 
     #[test]
-    fn total_intersects_sphere() {
+    fn total_intersect_sphere() {
         quickcheck(
-            intersects_sphere_helper::<BinnedSahPartition<Six, TotalAabbLimit>> as
-                fn(ArbitraryAabbVec, Vec<(ArbitrarySphere, usize)>, usize) -> bool,
+            intersect_sphere_helper::<BinnedSahPartition<Six, TotalAabbLimit>> as
+                fn(ArbitraryAabbVec,
+                   ArbitraryAabbVec,
+                   Vec<(ArbitrarySphere, usize)>,
+                   usize)
+                   -> bool,
         );
     }
 
     #[test]
-    fn centroid_intersects_sphere() {
+    fn centroid_intersect_sphere() {
         quickcheck(
-            intersects_sphere_helper::<BinnedSahPartition<Two, CentroidAabbLimit>> as
-                fn(ArbitraryAabbVec, Vec<(ArbitrarySphere, usize)>, usize) -> bool,
+            intersect_sphere_helper::<BinnedSahPartition<Two, CentroidAabbLimit>> as
+                fn(ArbitraryAabbVec,
+                   ArbitraryAabbVec,
+                   Vec<(ArbitrarySphere, usize)>,
+                   usize)
+                   -> bool,
         );
+    }
+
+
+    #[test]
+    fn small_sphere_probe() {
+        let bb = Aabb::of_points(&[vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0)]);
+
+        assert!(SmallSphereProbe::new(vec3(0.0, 0.0, 0.0), 1.0).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(0.0, 0.0, 0.0), 0.1).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(0.0, 0.0, 0.0), 10.0).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(2.0, 0.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(0.0, 2.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(0.0, 0.0, 2.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(2.0, 2.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(0.0, 2.0, 2.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(2.0, 0.0, 2.0), 1.5).intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(2.0, 0.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(0.0, 2.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(0.0, 0.0, 2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(2.0, 2.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(0.0, 2.0, 2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(2.0, 0.0, 2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(-2.0, 0.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(0.0, -2.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(0.0, 0.0, -2.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(-2.0, -2.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(0.0, -2.0, -2.0), 1.5).intersect_bool(bb));
+        assert!(SmallSphereProbe::new(vec3(-2.0, 0.0, -2.0), 1.5).intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(-2.0, 0.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(0.0, -2.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(0.0, 0.0, -2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(-2.0, -2.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(0.0, -2.0, -2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!SmallSphereProbe::new(vec3(-2.0, 0.0, -2.0), 0.9)
+            .intersect_bool(bb));
+    }
+
+    #[test]
+    fn large_sphere_probe() {
+        let bb = Aabb::of_points(&[vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0)]);
+
+        assert!(LargeSphereProbe::new(vec3(0.0, 0.0, 0.0), 1.0).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(0.0, 0.0, 0.0), 0.1).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(0.0, 0.0, 0.0), 10.0).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(2.0, 0.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(0.0, 2.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(0.0, 0.0, 2.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(2.0, 2.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(0.0, 2.0, 2.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(2.0, 0.0, 2.0), 1.5).intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(2.0, 0.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(0.0, 2.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(0.0, 0.0, 2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(2.0, 2.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(0.0, 2.0, 2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(2.0, 0.0, 2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(-2.0, 0.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(0.0, -2.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(0.0, 0.0, -2.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(-2.0, -2.0, 0.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(0.0, -2.0, -2.0), 1.5).intersect_bool(bb));
+        assert!(LargeSphereProbe::new(vec3(-2.0, 0.0, -2.0), 1.5).intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(-2.0, 0.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(0.0, -2.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(0.0, 0.0, -2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(-2.0, -2.0, 0.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(0.0, -2.0, -2.0), 0.9)
+            .intersect_bool(bb));
+        assert!(!LargeSphereProbe::new(vec3(-2.0, 0.0, -2.0), 0.9)
+            .intersect_bool(bb));
     }
 }
